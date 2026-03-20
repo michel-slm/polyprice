@@ -64,6 +64,23 @@ enum Command {
         #[arg(short, long, default_value = "6mo")]
         range: String,
     },
+    /// Show effective annual yield (price + dividends)
+    Yield {
+        /// Ticker symbol (e.g. BSV, AAPL, VBTLX)
+        symbol: String,
+
+        /// Convert to a currency (e.g. EUR, GBP, JPY)
+        #[arg(short, long)]
+        currency: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Time range (1y, 2y, 5y, max)
+        #[arg(short, long, default_value = "1y")]
+        range: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -94,6 +111,38 @@ struct DividendRecord {
     amount_local: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exchange_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+}
+
+#[derive(Serialize)]
+struct YieldReport {
+    symbol: String,
+    range: String,
+    days: i64,
+    start_date: String,
+    end_date: String,
+    start_price_usd: f64,
+    end_price_usd: f64,
+    price_change_usd: f64,
+    total_dividends_usd: f64,
+    total_return_usd: f64,
+    total_return_pct: f64,
+    annualized_yield_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_price_local: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_price_local: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_change_local: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_dividends_local: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_return_local: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_return_local_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annualized_yield_local_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
 }
@@ -143,6 +192,16 @@ fn format_change(val: f64) -> String {
     } else {
         format!("{val:.2}")
     }
+}
+
+/// Annualize a total return percentage over a number of days.
+/// Uses compound annual growth rate: (1 + r)^(365/days) - 1
+fn annualize(total_return_pct: f64, days: i64) -> f64 {
+    if days <= 0 {
+        return 0.0;
+    }
+    let r = total_return_pct / 100.0;
+    ((1.0 + r).powf(365.0 / days as f64) - 1.0) * 100.0
 }
 
 #[tokio::main]
@@ -373,6 +432,183 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "{:<12} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>12} {:>10} {:>10}",
                         r.date, r.open, r.high, r.low, r.close, r.volume, chg, cum
                     );
+                }
+            }
+        }
+        Command::Yield {
+            symbol,
+            currency,
+            json,
+            range,
+        } => {
+            let provider = yahoo::YahooConnector::new()?;
+            let response = provider.get_quote_range(&symbol, "1d", &range).await?;
+            let quotes = response.quotes()?;
+            let dividends = response.dividends()?;
+
+            if quotes.len() < 2 {
+                return Err("not enough price data".into());
+            }
+
+            let first = quotes.first().unwrap();
+            let last = quotes.last().unwrap();
+
+            let start_date =
+                DateTime::from_timestamp(first.timestamp as i64, 0).unwrap_or_default();
+            let end_date = DateTime::from_timestamp(last.timestamp as i64, 0).unwrap_or_default();
+            let days = (end_date - start_date).num_days();
+
+            let start_price_usd = first.close;
+            let end_price_usd = last.close;
+            let price_change_usd = end_price_usd - start_price_usd;
+            let total_dividends_usd: f64 = dividends
+                .iter()
+                .map(|d| d.amount.to_f64().unwrap_or(0.0))
+                .sum();
+            let total_return_usd = price_change_usd + total_dividends_usd;
+            let total_return_pct = (total_return_usd / start_price_usd) * 100.0;
+            let annualized_yield_pct = annualize(total_return_pct, days);
+
+            let has_currency = currency.is_some();
+            let currency_label = currency.as_ref().map(|c| c.to_uppercase());
+            let currency_is_usd = currency_label.as_deref() == Some("USD");
+
+            let (
+                start_price_local,
+                end_price_local,
+                price_change_local,
+                total_dividends_local,
+                total_return_local,
+                total_return_local_pct,
+                annualized_yield_local_pct,
+            ) = if has_currency && !currency_is_usd {
+                let fx_rates = get_exchange_rates(
+                    &provider,
+                    "USD",
+                    currency_label.as_deref().unwrap(),
+                    "1d",
+                    &range,
+                )
+                .await?;
+
+                let start_str = start_date.format("%Y-%m-%d").to_string();
+                let end_str = end_date.format("%Y-%m-%d").to_string();
+                let mut last_rate = 1.0_f64;
+                let start_rate = lookup_rate(&fx_rates, &start_str, &mut last_rate, false);
+                let end_rate = lookup_rate(&fx_rates, &end_str, &mut last_rate, false);
+
+                let sp = start_price_usd * start_rate;
+                let ep = end_price_usd * end_rate;
+                let pc = ep - sp;
+
+                let mut div_local = 0.0_f64;
+                let mut lr = 1.0_f64;
+                for d in &dividends {
+                    let dt: DateTime<Utc> = DateTime::from_timestamp(d.date, 0).unwrap_or_default();
+                    let date = dt.format("%Y-%m-%d").to_string();
+                    let rate = lookup_rate(&fx_rates, &date, &mut lr, false);
+                    div_local += d.amount.to_f64().unwrap_or(0.0) * rate;
+                }
+
+                let tr = pc + div_local;
+                let tr_pct = (tr / sp) * 100.0;
+                let ay_pct = annualize(tr_pct, days);
+
+                (
+                    Some(sp),
+                    Some(ep),
+                    Some(pc),
+                    Some(div_local),
+                    Some(tr),
+                    Some(tr_pct),
+                    Some(ay_pct),
+                )
+            } else if has_currency {
+                // USD explicitly requested
+                (
+                    Some(start_price_usd),
+                    Some(end_price_usd),
+                    Some(price_change_usd),
+                    Some(total_dividends_usd),
+                    Some(total_return_usd),
+                    Some(total_return_pct),
+                    Some(annualized_yield_pct),
+                )
+            } else {
+                (None, None, None, None, None, None, None)
+            };
+
+            let report = YieldReport {
+                symbol: symbol.clone(),
+                range: range.clone(),
+                days,
+                start_date: start_date.format("%Y-%m-%d").to_string(),
+                end_date: end_date.format("%Y-%m-%d").to_string(),
+                start_price_usd,
+                end_price_usd,
+                price_change_usd,
+                total_dividends_usd,
+                total_return_usd,
+                total_return_pct,
+                annualized_yield_pct,
+                start_price_local,
+                end_price_local,
+                price_change_local,
+                total_dividends_local,
+                total_return_local,
+                total_return_local_pct,
+                annualized_yield_local_pct,
+                currency: currency_label.clone(),
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{} — effective yield over {}", symbol, range);
+                println!(
+                    "Period:       {} to {} ({} days)",
+                    report.start_date, report.end_date, days
+                );
+                println!();
+                println!("  USD:");
+                println!("    Start price:      {:>10.2}", start_price_usd);
+                println!("    End price:        {:>10.2}", end_price_usd);
+                println!("    Price change:     {:>10.2}", price_change_usd);
+                println!("    Dividends:        {:>10.2}", total_dividends_usd);
+                println!(
+                    "    Total return:     {:>10.2} ({:+.2}%)",
+                    total_return_usd, total_return_pct
+                );
+                println!(
+                    "    Annualized yield: {:>10}  ({:+.2}%)",
+                    "", annualized_yield_pct
+                );
+
+                if let Some(cur) = currency_label.as_deref() {
+                    if cur != "USD" {
+                        println!();
+                        println!("  {cur}:");
+                        println!("    Start price:      {:>10.2}", start_price_local.unwrap());
+                        println!("    End price:        {:>10.2}", end_price_local.unwrap());
+                        println!(
+                            "    Price change:     {:>10.2}",
+                            price_change_local.unwrap()
+                        );
+                        println!(
+                            "    Dividends:        {:>10.2}",
+                            total_dividends_local.unwrap()
+                        );
+                        println!(
+                            "    Total return:     {:>10.2} ({:+.2}%)",
+                            total_return_local.unwrap(),
+                            total_return_local_pct.unwrap()
+                        );
+                        println!(
+                            "    Annualized yield: {:>10}  ({:+.2}%)",
+                            "",
+                            annualized_yield_local_pct.unwrap()
+                        );
+                    }
                 }
             }
         }
