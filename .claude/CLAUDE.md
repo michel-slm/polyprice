@@ -1,0 +1,24 @@
+# Project Guidelines
+
+## Git
+- Always use `git commit -s` (sign-off) when committing
+- Always use `git tag -s` (GPG sign) when tagging
+- Before tagging a release, update CHANGELOG.md and README.md. Use the tag message identical to the new CHANGELOG.md entry
+- Before tagging, verify there are no uncommitted changes (`git status` must be clean)
+- Before tagging, publish to crates.io with `cargo publish`. If publish fails, fix the issue before tagging so the tag always corresponds to a successful publish
+- After publishing and tagging, push with `git push --follow-tags`
+
+## Code Style
+- Always run `cargo fmt` before committing
+- Every source file must start with `// SPDX-License-Identifier: MPL-2.0`
+- CLI help text (`-h` and `--help`) must not exceed 80 characters per line
+- Keep the `Command` enum variants in `main.rs` sorted alphabetically (this determines the order in `--help` output)
+
+## CLI behavior
+- Non-interactive subcommands (e.g. `show`, `search`) must support a `--json` flag that outputs pretty-printed, machine-readable JSON instead of human-readable text
+- The CLI must support `--version` and display its name, version, and short description (matching `Cargo.toml` `description`) in the `--help` header. In clap, use `#[command(version, about, long_about = None, before_help = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION")))]`
+
+## Testing
+- Always write corresponding tests when adding or modifying features
+- Run `cargo cov` before committing to verify tests pass and coverage does not regress
+- Coverage must stay at or above 72% line coverage

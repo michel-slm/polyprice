@@ -1,0 +1,8 @@
+[package]
+name = "polyprice"
+version = "0.1.0"
+edition = "2024"
+description = "A price comparison tool"
+license = "MPL-2.0"
+
+[dependencies]
