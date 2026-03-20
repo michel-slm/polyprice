@@ -30,9 +30,9 @@ enum Command {
         /// Ticker symbol (e.g. BSV, AAPL, VBTLX)
         symbol: String,
 
-        /// Convert amounts to a currency (e.g. EUR, GBP)
+        /// Convert to currency (repeatable)
         #[arg(short, long)]
-        currency: Option<String>,
+        currency: Vec<String>,
 
         /// Output as JSON
         #[arg(long)]
@@ -47,10 +47,9 @@ enum Command {
         /// Ticker symbol (e.g. BSV, AAPL, VBTLX)
         symbol: String,
 
-        /// Convert prices to a currency (e.g. EUR, GBP,
-        /// JPY)
+        /// Convert to currency (repeatable)
         #[arg(short, long)]
-        currency: Option<String>,
+        currency: Vec<String>,
 
         /// Interval: 1d, 1wk, 1mo
         #[arg(short, long, default_value = "1d")]
@@ -69,9 +68,9 @@ enum Command {
         /// Ticker symbol (e.g. BSV, AAPL, VBTLX)
         symbol: String,
 
-        /// Convert to a currency (e.g. EUR, GBP, JPY)
+        /// Convert to currency (repeatable)
         #[arg(short, long)]
-        currency: Option<String>,
+        currency: Vec<String>,
 
         /// Output as JSON
         #[arg(long)]
@@ -81,6 +80,17 @@ enum Command {
         #[arg(short, long, default_value = "1y")]
         range: String,
     },
+}
+
+// -- Data structures for JSON output --
+
+#[derive(Serialize)]
+struct CurrencyValues {
+    currency: String,
+    close: f64,
+    change: Option<f64>,
+    cumulative: Option<f64>,
+    exchange_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -93,26 +103,49 @@ struct PriceRecord {
     volume: u64,
     change_usd: Option<f64>,
     cumulative_usd: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    change_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cumulative_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exchange_rate: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    currency: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    currencies: Vec<CurrencyValues>,
+}
+
+#[derive(Serialize)]
+struct DividendCurrency {
+    currency: String,
+    amount: f64,
+    exchange_rate: f64,
 }
 
 #[derive(Serialize)]
 struct DividendRecord {
     date: String,
     amount_usd: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amount_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exchange_rate: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    currency: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    currencies: Vec<DividendCurrency>,
+}
+
+#[derive(Serialize)]
+struct DividendSummary {
+    dividends: Vec<DividendRecord>,
+    total_usd: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    totals: Vec<DividendCurrencyTotal>,
+}
+
+#[derive(Serialize)]
+struct DividendCurrencyTotal {
+    currency: String,
+    total: f64,
+}
+
+#[derive(Serialize)]
+struct CurrencyYield {
+    currency: String,
+    start_price: f64,
+    end_price: f64,
+    price_change: f64,
+    total_dividends: f64,
+    total_return: f64,
+    total_return_pct: f64,
+    annualized_yield_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -129,22 +162,8 @@ struct YieldReport {
     total_return_usd: f64,
     total_return_pct: f64,
     annualized_yield_pct: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start_price_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    end_price_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    price_change_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    total_dividends_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    total_return_local: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    total_return_local_pct: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    annualized_yield_local_pct: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    currency: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    currencies: Vec<CurrencyYield>,
 }
 
 /// Fetch historical exchange rates and return a map from
@@ -168,17 +187,28 @@ async fn get_exchange_rates(
     Ok(rates)
 }
 
+/// Fetch exchange rates for multiple currencies, skipping USD.
+async fn get_all_exchange_rates(
+    provider: &yahoo::YahooConnector,
+    currencies: &[String],
+    interval: &str,
+    range: &str,
+) -> Result<HashMap<String, HashMap<String, f64>>, Box<dyn std::error::Error>> {
+    let mut all_rates = HashMap::new();
+    for cur in currencies {
+        if cur == "USD" {
+            continue;
+        }
+        let rates = get_exchange_rates(provider, "USD", cur, interval, range).await?;
+        all_rates.insert(cur.clone(), rates);
+    }
+    Ok(all_rates)
+}
+
 /// Look up the exchange rate for a date, falling back to the
 /// most recent known rate.
-fn lookup_rate(
-    fx_rates: &HashMap<String, f64>,
-    date: &str,
-    last_rate: &mut f64,
-    currency_is_usd: bool,
-) -> f64 {
-    if currency_is_usd {
-        1.0
-    } else if let Some(&r) = fx_rates.get(date) {
+fn lookup_rate(fx_rates: &HashMap<String, f64>, date: &str, last_rate: &mut f64) -> f64 {
+    if let Some(&r) = fx_rates.get(date) {
         *last_rate = r;
         r
     } else {
@@ -204,6 +234,18 @@ fn annualize(total_return_pct: f64, days: i64) -> f64 {
     ((1.0 + r).powf(365.0 / days as f64) - 1.0) * 100.0
 }
 
+/// Normalize currency list: uppercase, deduplicate.
+fn normalize_currencies(currencies: &[String]) -> Vec<String> {
+    let mut seen = Vec::new();
+    for c in currencies {
+        let upper = c.to_uppercase();
+        if !seen.contains(&upper) {
+            seen.push(upper);
+        }
+    }
+    seen
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -215,30 +257,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             json,
             range,
         } => {
+            let currencies = normalize_currencies(&currency);
             let provider = yahoo::YahooConnector::new()?;
             let response = provider.get_quote_range(&symbol, "1d", &range).await?;
             let dividends = response.dividends()?;
 
-            let has_currency = currency.is_some();
-            let currency_label = currency.as_ref().map(|c| c.to_uppercase());
-            let currency_is_usd = currency_label.as_deref() == Some("USD");
+            let all_rates = get_all_exchange_rates(&provider, &currencies, "1d", &range).await?;
 
-            let fx_rates = if has_currency && !currency_is_usd {
-                get_exchange_rates(
-                    &provider,
-                    "USD",
-                    currency_label.as_deref().unwrap(),
-                    "1d",
-                    &range,
-                )
-                .await?
-            } else {
-                HashMap::new()
-            };
-
-            let mut last_rate = 1.0_f64;
+            // Track last known rate per currency
+            let mut last_rates: HashMap<String, f64> =
+                currencies.iter().map(|c| (c.clone(), 1.0)).collect();
+            let mut totals: HashMap<String, f64> =
+                currencies.iter().map(|c| (c.clone(), 0.0)).collect();
             let mut total_usd = 0.0_f64;
-            let mut total_local = 0.0_f64;
+
             let records: Vec<DividendRecord> = dividends
                 .iter()
                 .map(|d| {
@@ -247,52 +279,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let amount_usd = d.amount.to_f64().unwrap_or(0.0);
                     total_usd += amount_usd;
 
-                    let (amount_local, exchange_rate) = if has_currency {
-                        let rate = lookup_rate(&fx_rates, &date, &mut last_rate, currency_is_usd);
-                        let local = amount_usd * rate;
-                        total_local += local;
-                        (Some(local), Some(rate))
-                    } else {
-                        (None, None)
-                    };
+                    let cur_values: Vec<DividendCurrency> = currencies
+                        .iter()
+                        .map(|cur| {
+                            let rate = if cur == "USD" {
+                                1.0
+                            } else {
+                                let fx = all_rates.get(cur).unwrap();
+                                lookup_rate(fx, &date, last_rates.get_mut(cur).unwrap())
+                            };
+                            let amount = amount_usd * rate;
+                            *totals.get_mut(cur).unwrap() += amount;
+                            DividendCurrency {
+                                currency: cur.clone(),
+                                amount,
+                                exchange_rate: rate,
+                            }
+                        })
+                        .collect();
 
                     DividendRecord {
                         date,
                         amount_usd,
-                        amount_local,
-                        exchange_rate,
-                        currency: currency_label.clone(),
+                        currencies: cur_values,
                     }
                 })
                 .collect();
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&records)?);
-            } else if has_currency {
-                let cur = currency_label.as_deref().unwrap();
-                println!(
-                    "{:<12} {:>12} {:>12} {:>11}",
-                    "Date",
-                    "Amt(USD)",
-                    format!("Amt({cur})"),
-                    "Rate"
-                );
-                for r in &records {
-                    println!(
-                        "{:<12} {:>12.4} {:>12.4} {:>11.4}",
-                        r.date,
-                        r.amount_usd,
-                        r.amount_local.unwrap_or(0.0),
-                        r.exchange_rate.unwrap_or(1.0)
-                    );
-                }
-                println!("{:<12} {:>12.4} {:>12.4}", "Total", total_usd, total_local);
-            } else {
+                let summary = DividendSummary {
+                    dividends: records,
+                    total_usd,
+                    totals: currencies
+                        .iter()
+                        .map(|c| DividendCurrencyTotal {
+                            currency: c.clone(),
+                            total: totals[c],
+                        })
+                        .collect(),
+                };
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else if currencies.is_empty() {
                 println!("{:<12} {:>12}", "Date", "Amt(USD)");
                 for r in &records {
                     println!("{:<12} {:>12.4}", r.date, r.amount_usd);
                 }
                 println!("{:<12} {:>12.4}", "Total", total_usd);
+            } else {
+                // Header
+                print!("{:<12} {:>12}", "Date", "Amt(USD)");
+                for cur in &currencies {
+                    print!(" {:>12} {:>8}", format!("Amt({cur})"), format!("R({cur})"));
+                }
+                println!();
+                // Rows
+                for r in &records {
+                    print!("{:<12} {:>12.4}", r.date, r.amount_usd);
+                    for cv in &r.currencies {
+                        print!(" {:>12.4} {:>8.4}", cv.amount, cv.exchange_rate);
+                    }
+                    println!();
+                }
+                // Totals
+                print!("{:<12} {:>12.4}", "Total", total_usd);
+                for cur in &currencies {
+                    print!(" {:>12.4} {:>8}", totals[cur], "");
+                }
+                println!();
             }
         }
         Command::History {
@@ -302,31 +355,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             json,
             range,
         } => {
+            let currencies = normalize_currencies(&currency);
             let provider = yahoo::YahooConnector::new()?;
             let response = provider.get_quote_range(&symbol, &interval, &range).await?;
             let quotes = response.quotes()?;
 
-            let has_currency = currency.is_some();
-            let currency_label = currency.as_ref().map(|c| c.to_uppercase());
-            let currency_is_usd = currency_label.as_deref() == Some("USD");
-
-            let fx_rates = if has_currency && !currency_is_usd {
-                get_exchange_rates(
-                    &provider,
-                    "USD",
-                    currency_label.as_deref().unwrap(),
-                    &interval,
-                    &range,
-                )
-                .await?
-            } else {
-                HashMap::new()
-            };
+            let all_rates =
+                get_all_exchange_rates(&provider, &currencies, &interval, &range).await?;
 
             let mut prev_close_usd: Option<f64> = None;
             let mut cumul_usd = 0.0_f64;
-            let mut cumul_local = 0.0_f64;
-            let mut last_rate = 1.0_f64;
+
+            // Per-currency tracking
+            let mut last_rates: HashMap<String, f64> =
+                currencies.iter().map(|c| (c.clone(), 1.0)).collect();
+            let mut cumul_local: HashMap<String, f64> =
+                currencies.iter().map(|c| (c.clone(), 0.0)).collect();
+
             let records: Vec<PriceRecord> = quotes
                 .iter()
                 .map(|q| {
@@ -334,93 +379,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         DateTime::from_timestamp(q.timestamp as i64, 0).unwrap_or_default();
                     let date = dt.format("%Y-%m-%d").to_string();
 
-                    let rate = if has_currency {
-                        lookup_rate(&fx_rates, &date, &mut last_rate, currency_is_usd)
-                    } else {
-                        1.0
-                    };
-
                     let change_usd = prev_close_usd.map(|prev| q.close - prev);
                     if let Some(c) = change_usd {
                         cumul_usd += c;
                     }
-                    let change_local = if has_currency {
-                        change_usd.map(|c| c * rate)
-                    } else {
-                        None
-                    };
-                    if let Some(c) = change_local {
-                        cumul_local += c;
-                    }
                     prev_close_usd = Some(q.close);
+
+                    let cur_values: Vec<CurrencyValues> = currencies
+                        .iter()
+                        .map(|cur| {
+                            let rate = if cur == "USD" {
+                                1.0
+                            } else {
+                                let fx = all_rates.get(cur).unwrap();
+                                lookup_rate(fx, &date, last_rates.get_mut(cur).unwrap())
+                            };
+                            let change = change_usd.map(|c| c * rate);
+                            if let Some(c) = change {
+                                *cumul_local.get_mut(cur).unwrap() += c;
+                            }
+                            CurrencyValues {
+                                currency: cur.clone(),
+                                close: q.close * rate,
+                                change,
+                                cumulative: if change.is_some() {
+                                    Some(cumul_local[cur])
+                                } else {
+                                    None
+                                },
+                                exchange_rate: rate,
+                            }
+                        })
+                        .collect();
 
                     PriceRecord {
                         date,
-                        open: q.open * rate,
-                        high: q.high * rate,
-                        low: q.low * rate,
-                        close: q.close * rate,
+                        open: q.open,
+                        high: q.high,
+                        low: q.low,
+                        close: q.close,
                         volume: q.volume,
                         change_usd,
-                        cumulative_usd: if prev_close_usd.is_some() {
-                            Some(cumul_usd)
-                        } else {
-                            None
-                        },
-                        change_local,
-                        cumulative_local: if has_currency && change_local.is_some() {
-                            Some(cumul_local)
-                        } else {
-                            None
-                        },
-                        exchange_rate: if has_currency { Some(rate) } else { None },
-                        currency: currency_label.clone(),
+                        cumulative_usd: Some(cumul_usd),
+                        currencies: cur_values,
                     }
                 })
                 .collect();
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&records)?);
-            } else if has_currency {
-                let cur = currency_label.as_deref().unwrap();
-                println!(
-                    "{:<12} {:>10} {:>10} {:>10} {:>10} {:>12} \
-                     {:>10} {:>10} {:>8} {:>8} {:>11}",
-                    "Date",
-                    format!("Open({cur})"),
-                    format!("High({cur})"),
-                    format!("Low({cur})"),
-                    format!("Close({cur})"),
-                    "Volume",
-                    "Chg(USD)",
-                    "Cum(USD)",
-                    format!("Chg({cur})"),
-                    format!("Cum({cur})"),
-                    "Rate"
-                );
-                for r in &records {
-                    let chg_usd = r.change_usd.map(format_change).unwrap_or_default();
-                    let cum_usd = r.cumulative_usd.map(format_change).unwrap_or_default();
-                    let chg_local = r.change_local.map(format_change).unwrap_or_default();
-                    let cum_local = r.cumulative_local.map(format_change).unwrap_or_default();
-                    let rate = r.exchange_rate.unwrap_or(1.0);
-                    println!(
-                        "{:<12} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>12} \
-                         {:>10} {:>10} {:>8} {:>8} {:>11.4}",
-                        r.date,
-                        r.open,
-                        r.high,
-                        r.low,
-                        r.close,
-                        r.volume,
-                        chg_usd,
-                        cum_usd,
-                        chg_local,
-                        cum_local,
-                        rate
-                    );
-                }
             } else {
+                // Print USD table
                 println!(
                     "{:<12} {:>10} {:>10} {:>10} {:>10} {:>12} {:>10} {:>10}",
                     "Date", "Open", "High", "Low", "Close", "Volume", "Chg(USD)", "Cum(USD)"
@@ -433,6 +442,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         r.date, r.open, r.high, r.low, r.close, r.volume, chg, cum
                     );
                 }
+
+                // Print a table per currency
+                for cur in &currencies {
+                    if cur == "USD" {
+                        continue;
+                    }
+                    println!();
+                    println!(
+                        "{:<12} {:>10} {:>8} {:>8} {:>11}",
+                        "Date",
+                        format!("Close({cur})"),
+                        format!("Chg({cur})"),
+                        format!("Cum({cur})"),
+                        "Rate"
+                    );
+                    for r in &records {
+                        let cv = r.currencies.iter().find(|v| v.currency == *cur).unwrap();
+                        let chg = cv.change.map(format_change).unwrap_or_default();
+                        let cum = cv.cumulative.map(format_change).unwrap_or_default();
+                        println!(
+                            "{:<12} {:>10.2} {:>8} {:>8} {:>11.4}",
+                            r.date, cv.close, chg, cum, cv.exchange_rate
+                        );
+                    }
+                }
             }
         }
         Command::Yield {
@@ -441,6 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             json,
             range,
         } => {
+            let currencies = normalize_currencies(&currency);
             let provider = yahoo::YahooConnector::new()?;
             let response = provider.get_quote_range(&symbol, "1d", &range).await?;
             let quotes = response.quotes()?;
@@ -469,81 +504,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let total_return_pct = (total_return_usd / start_price_usd) * 100.0;
             let annualized_yield_pct = annualize(total_return_pct, days);
 
-            let has_currency = currency.is_some();
-            let currency_label = currency.as_ref().map(|c| c.to_uppercase());
-            let currency_is_usd = currency_label.as_deref() == Some("USD");
+            let all_rates = get_all_exchange_rates(&provider, &currencies, "1d", &range).await?;
 
-            let (
-                start_price_local,
-                end_price_local,
-                price_change_local,
-                total_dividends_local,
-                total_return_local,
-                total_return_local_pct,
-                annualized_yield_local_pct,
-            ) = if has_currency && !currency_is_usd {
-                let fx_rates = get_exchange_rates(
-                    &provider,
-                    "USD",
-                    currency_label.as_deref().unwrap(),
-                    "1d",
-                    &range,
-                )
-                .await?;
+            let start_str = start_date.format("%Y-%m-%d").to_string();
+            let end_str = end_date.format("%Y-%m-%d").to_string();
 
-                let start_str = start_date.format("%Y-%m-%d").to_string();
-                let end_str = end_date.format("%Y-%m-%d").to_string();
-                let mut last_rate = 1.0_f64;
-                let start_rate = lookup_rate(&fx_rates, &start_str, &mut last_rate, false);
-                let end_rate = lookup_rate(&fx_rates, &end_str, &mut last_rate, false);
+            let currency_yields: Vec<CurrencyYield> = currencies
+                .iter()
+                .filter(|c| *c != "USD")
+                .map(|cur| {
+                    let fx = all_rates.get(cur).unwrap();
+                    let mut lr = 1.0_f64;
+                    let start_rate = lookup_rate(fx, &start_str, &mut lr);
+                    let end_rate = lookup_rate(fx, &end_str, &mut lr);
 
-                let sp = start_price_usd * start_rate;
-                let ep = end_price_usd * end_rate;
-                let pc = ep - sp;
+                    let sp = start_price_usd * start_rate;
+                    let ep = end_price_usd * end_rate;
+                    let pc = ep - sp;
 
-                let mut div_local = 0.0_f64;
-                let mut lr = 1.0_f64;
-                for d in &dividends {
-                    let dt: DateTime<Utc> = DateTime::from_timestamp(d.date, 0).unwrap_or_default();
-                    let date = dt.format("%Y-%m-%d").to_string();
-                    let rate = lookup_rate(&fx_rates, &date, &mut lr, false);
-                    div_local += d.amount.to_f64().unwrap_or(0.0) * rate;
-                }
+                    let mut div_local = 0.0_f64;
+                    let mut dlr = 1.0_f64;
+                    for d in &dividends {
+                        let dt: DateTime<Utc> =
+                            DateTime::from_timestamp(d.date, 0).unwrap_or_default();
+                        let date = dt.format("%Y-%m-%d").to_string();
+                        let rate = lookup_rate(fx, &date, &mut dlr);
+                        div_local += d.amount.to_f64().unwrap_or(0.0) * rate;
+                    }
 
-                let tr = pc + div_local;
-                let tr_pct = (tr / sp) * 100.0;
-                let ay_pct = annualize(tr_pct, days);
+                    let tr = pc + div_local;
+                    let tr_pct = (tr / sp) * 100.0;
+                    let ay_pct = annualize(tr_pct, days);
 
-                (
-                    Some(sp),
-                    Some(ep),
-                    Some(pc),
-                    Some(div_local),
-                    Some(tr),
-                    Some(tr_pct),
-                    Some(ay_pct),
-                )
-            } else if has_currency {
-                // USD explicitly requested
-                (
-                    Some(start_price_usd),
-                    Some(end_price_usd),
-                    Some(price_change_usd),
-                    Some(total_dividends_usd),
-                    Some(total_return_usd),
-                    Some(total_return_pct),
-                    Some(annualized_yield_pct),
-                )
-            } else {
-                (None, None, None, None, None, None, None)
-            };
+                    CurrencyYield {
+                        currency: cur.clone(),
+                        start_price: sp,
+                        end_price: ep,
+                        price_change: pc,
+                        total_dividends: div_local,
+                        total_return: tr,
+                        total_return_pct: tr_pct,
+                        annualized_yield_pct: ay_pct,
+                    }
+                })
+                .collect();
 
             let report = YieldReport {
                 symbol: symbol.clone(),
                 range: range.clone(),
                 days,
-                start_date: start_date.format("%Y-%m-%d").to_string(),
-                end_date: end_date.format("%Y-%m-%d").to_string(),
+                start_date: start_str.clone(),
+                end_date: end_str.clone(),
                 start_price_usd,
                 end_price_usd,
                 price_change_usd,
@@ -551,14 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_return_usd,
                 total_return_pct,
                 annualized_yield_pct,
-                start_price_local,
-                end_price_local,
-                price_change_local,
-                total_dividends_local,
-                total_return_local,
-                total_return_local_pct,
-                annualized_yield_local_pct,
-                currency: currency_label.clone(),
+                currencies: currency_yields,
             };
 
             if json {
@@ -584,31 +588,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "", annualized_yield_pct
                 );
 
-                if let Some(cur) = currency_label.as_deref() {
-                    if cur != "USD" {
-                        println!();
-                        println!("  {cur}:");
-                        println!("    Start price:      {:>10.2}", start_price_local.unwrap());
-                        println!("    End price:        {:>10.2}", end_price_local.unwrap());
-                        println!(
-                            "    Price change:     {:>10.2}",
-                            price_change_local.unwrap()
-                        );
-                        println!(
-                            "    Dividends:        {:>10.2}",
-                            total_dividends_local.unwrap()
-                        );
-                        println!(
-                            "    Total return:     {:>10.2} ({:+.2}%)",
-                            total_return_local.unwrap(),
-                            total_return_local_pct.unwrap()
-                        );
-                        println!(
-                            "    Annualized yield: {:>10}  ({:+.2}%)",
-                            "",
-                            annualized_yield_local_pct.unwrap()
-                        );
-                    }
+                for cy in &report.currencies {
+                    println!();
+                    println!("  {}:", cy.currency);
+                    println!("    Start price:      {:>10.2}", cy.start_price);
+                    println!("    End price:        {:>10.2}", cy.end_price);
+                    println!("    Price change:     {:>10.2}", cy.price_change);
+                    println!("    Dividends:        {:>10.2}", cy.total_dividends);
+                    println!(
+                        "    Total return:     {:>10.2} ({:+.2}%)",
+                        cy.total_return, cy.total_return_pct
+                    );
+                    println!(
+                        "    Annualized yield: {:>10}  ({:+.2}%)",
+                        "", cy.annualized_yield_pct
+                    );
                 }
             }
         }
